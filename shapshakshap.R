@@ -31,6 +31,9 @@ data$Avg_Weight <- as.character(data$Avg_Weight)
 data$Avg_Weight[data$Avg_Weight %in% c("", "N/A", "NA", "unknown")] <- NA
 data$Avg_Weight <- as.numeric(data$Avg_Weight)
 
+# Global list to store SHAP results
+shap_results_all <- list()
+
 # Impute NAs in target
 if (any(is.na(data$Avg_Weight))) {
   median_weight <- median(data$Avg_Weight, na.rm = TRUE)
@@ -166,17 +169,25 @@ run_shap <- function(model, model_name, predictor_func = NULL, data_set = X_scal
     imp <- FeatureImp$new(predictor, loss = "rmse")
     cat("imp class:", class(imp), "\n")
     if (!is.null(imp$results) && nrow(imp$results) > 0) {
+      top_n <- 10
       imp_data <- imp$results
       imp_data <- imp_data[order(-imp_data$importance), ]
-      # Plot using ggplot for better control
+      imp_data <- head(imp_data, top_n)
+      
+      
       p <- ggplot(imp_data, aes(x = reorder(feature, importance), y = importance)) +
-        geom_bar(stat = "identity", fill = "salmon") +
+        geom_bar(stat = "identity", fill = "steelblue") +
         coord_flip() +
         theme_minimal() +
-        labs(title = paste("Global Importance -", model_name),
-             x = "Feature",
-             y = "Importance") +
-        theme(legend.position = "none")
+        labs(
+          title = paste("Top", top_n, "Global Importance -", model_name),
+          x = "Feature",
+          y = "Importance"
+        ) +
+        theme(
+          plot.title = element_text(size = 14, face = "bold")
+        )
+      
       print(p)
       grDevices::dev.flush()
     } else {
@@ -255,6 +266,17 @@ run_shap <- function(model, model_name, predictor_func = NULL, data_set = X_scal
       shap_data$abs_phi <- abs(shap_data$phi)
       shap_data <- shap_data[order(-shap_data$abs_phi), ]
       
+      # Limit to top N features
+      top_n <- 10
+      shap_data <- head(shap_data, top_n)
+      
+      
+      shap_data$model <- model_name
+      shap_data$pond_id <- i
+      shap_results_all[[length(shap_results_all) + 1]] <<- shap_data[, c("model", "pond_id", "feature", "phi")]
+      
+      
+      
       # Save SHAP values
       shap_file <- file.path(output_dir, paste0("SHAP_", model_name, "_Pond_", i, ".csv"))
       write.csv(shap_data[, c("feature", "phi")], shap_file, row.names = FALSE)
@@ -265,17 +287,23 @@ run_shap <- function(model, model_name, predictor_func = NULL, data_set = X_scal
       cat("Opening PDF:", plot_file, "\n")
       pdf(plot_file, width = 10, height = 8)
       tryCatch({
-        p <- ggplot(shap_data, aes(x = reorder(feature, abs_phi), y = phi, fill = phi > 0)) +
+        p <- ggplot(shap_data, aes(x = reorder(feature, abs_phi), y = phi, fill = phi)) +
           geom_bar(stat = "identity") +
           coord_flip() +
-          scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "salmon"),
-                            labels = c("Positive", "Negative"),
-                            name = "SHAP Sign") +
+          scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0, name = "SHAP Value") +
           theme_minimal() +
-          labs(title = paste("SHAP Values -", model_name, "- Pond", i),
-               x = "Feature",
-               y = "SHAP Value (phi)") +
-          theme(legend.position = "bottom")
+          labs(
+            title = paste("Top", top_n, "SHAP Values -", model_name, "- Pond", i),
+            subtitle = "Positive values increase prediction, negative values decrease",
+            x = "Feature",
+            y = "SHAP Value (phi)"
+          ) +
+          theme(
+            legend.position = "bottom",
+            plot.title = element_text(size = 14, face = "bold"),
+            plot.subtitle = element_text(size = 10, face = "italic")
+          )
+        
         print(p)
         grDevices::dev.flush()
       }, error = function(e) {
@@ -320,9 +348,38 @@ xgb_model <- xgb.train(
   verbose = 1
 )
 
+
 run_shap(xgb_model, "XGBoost", predictor_func = function(model, newdata) predict(model, newdata = as.matrix(newdata)), data_set = X_raw)
 
 # Run SHAP for BPNN with improved predict function and training
 cat("Running SHAP for BPNN\n")
 bp_model <- nnet(x = X_scaled, y = y, size = 5, linout = TRUE, maxit = 1000, decay = 0.01)
 run_shap(bp_model, "BPNN", predictor_func = function(model, newdata) as.numeric(predict(model, newdata, type = "raw")), data_set = X_scaled)
+
+# Combine all SHAP results into one data frame
+if (length(shap_results_all) > 0) {
+  all_shap_df <- do.call(rbind, shap_results_all)
+  
+  # Save combined SHAP results
+  shap_summary_file <- file.path(output_dir, "SHAP_ALL_Results.csv")
+  write.csv(all_shap_df, shap_summary_file, row.names = FALSE)
+  # Compute mean absolute SHAP value per feature per model
+  global_summary <- aggregate(abs(phi) ~ feature + model, data = all_shap_df, FUN = mean)
+  
+  # Sort for readability
+  global_summary <- global_summary[order(global_summary$model, -global_summary$`abs(phi)`), ]
+  
+  # Save to CSV
+  global_summary_file <- file.path(output_dir, "SHAP_Global_Importance_Summary.csv")
+  write.csv(global_summary, global_summary_file, row.names = FALSE)
+  
+  cat("Global importance summary saved to:", global_summary_file, "\n")
+  
+  cat("Combined SHAP results saved to:", shap_summary_file, "\n")
+} else {
+  cat("Warning: No SHAP results were collected.\n")
+}
+
+
+
+
